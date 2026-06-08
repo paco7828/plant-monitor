@@ -1,290 +1,196 @@
-# Smart Flower Pot
+# Plant Monitor
 
-An ESP32-based smart plant monitoring and watering system with Home Assistant integration via MQTT.
+An ESP32-based smart plant monitoring system with automatic watering, Home Assistant integration via MQTT, and deep sleep power management. Consists of two independent units: the **Plant Monitor** (sensor node) and the **Watering Station** (pump actuator).
+
+---
+
+## System Overview
+
+```
+[Plant Monitor ESP32]  --MQTT-->  [MQTT Broker]  --MQTT-->  [Watering Station ESP32]
+        |                              |
+   Reads sensors                Home Assistant
+   Triggers watering cmd         Dashboard / Automations
+```
+
+The plant monitor reads sensors and publishes data. When soil moisture drops below the threshold it sends a watering command over MQTT. The watering station subscribes to that command and activates the pump. Both units connect independently to the same WiFi network and MQTT broker.
+
+---
+
+## Hardware
+
+### Plant Monitor
+
+| Component | GPIO |
+|-----------|------|
+| Soil moisture sensor (analog) | 0 |
+| DS18B20 temperature sensor (OneWire) | 1 |
+| LDR light sensor (analog) | 2 |
+| Buzzer | 3 |
+
+- ESP32 with deep sleep support
+- DS18B20 requires a 4.7k pull-up resistor on the data line
+
+### Watering Station
+
+| Component | GPIO |
+|-----------|------|
+| Pump relay / MOSFET | 0 |
+| Manual trigger button | 1 |
+
+- Separate ESP32 unit
+- Button is active LOW (internal pull-up enabled)
+- Manual button press activates the pump for the configured duration regardless of MQTT
+
+---
 
 ## Features
 
-- **Automatic plant watering** based on soil moisture levels
-- **Environmental monitoring** (temperature, humidity, light, water level)
-- **Home Assistant integration** with real-time sensor data
-- **Captive portal setup** for easy WiFi and MQTT configuration
-- **Low water level alerts** and watering notifications
-- **Energy efficient** with light-based sleep modes
+### Plant Monitor
 
-## Hardware Requirements
+**Sensors**
+- Soil moisture (analog ADC)
+- Ambient temperature via DS18B20 (Dallas OneWire)
+- Light presence detection (LDR with configurable threshold)
 
-- ESP32 development board
-- DHT22 temperature/humidity sensor
-- Soil moisture sensor
-- LDR (Light Dependent Resistor)
-- Water level sensor
-- Water pump (5V)
-- Connecting wires and breadboard/PCB
+**Power Management**
+- Deep sleep during dark periods (night), waking every 30 minutes to check and publish sensor data
+- Stays awake during daylight and publishes every 60 seconds
+- RTC memory (`RTC_DATA_ATTR`) persists boot count, sleep time accumulation, last watering time, and last low-moisture beep time across sleep cycles
 
-## Pin Configuration
+**Automation**
+- Automatic watering triggered when moisture falls below threshold (`MOISTURE_THRESHOLD = 2900`)
+- 5-minute cooldown between watering cycles, tracked across deep sleep via RTC memory
+- Low moisture buzzer alert every 5 minutes when soil is dry, also tracked across sleep
 
-| Component | ESP32 Pin |
-|-----------|-----------|
-| Soil Moisture Sensor | GPIO 0 |
-| LDR (Light Sensor) | GPIO 1 |
-| Water Level Sensor | GPIO 2 |
-| Water Pump | GPIO 3 |
-| DHT22 Sensor | GPIO 4 |
+**Configuration Portal**
+- On cold boot: opens WiFi AP (`Smart-Pot`, no password) for 3 minutes
+- Captive portal at `192.168.4.1` for entering WiFi SSID/password and MQTT broker settings
+- Settings persisted to NVS (`Preferences`)
+- On subsequent wakeups from sleep: connects directly using saved credentials
 
-## Installation
+### Watering Station
 
-### 1. Flash the ESP32
+- Subscribes to `smartpot/water_command`; activates pump for 5 seconds on receiving `"1"`
+- Manual button override: activates pump for 5 seconds regardless of MQTT state
+- Same captive portal setup flow as the plant monitor for WiFi + MQTT configuration
+- WiFi state machine with automatic retry every 15 seconds on connection failure
 
-1. Install the Arduino IDE with ESP32 board support
-2. Install required libraries:
-   - `WiFi` (built-in)
-   - `PubSubClient`
-   - `DHT sensor library`
-   - `Preferences` (built-in)
-   - `ESPAsyncWebServer`
-   - `AsyncTCP`
-3. Upload the `smart-pot.ino` sketch to your ESP32
+---
 
-### 2. Initial Setup
+## MQTT Topics
 
-1. Power on the ESP32
-2. Connect to the WiFi hotspot named **"Smart-flower-pot"**
-3. A captive portal will open automatically (or navigate to `http://4.3.2.1`)
-4. Enter your WiFi credentials and MQTT broker settings:
-   - **WiFi SSID**: Your home WiFi network name
-   - **WiFi Password**: Your home WiFi password
-   - **MQTT Server**: IP address of your MQTT broker
-   - **MQTT Port**: Usually `1883`
-   - **MQTT Username**: Your MQTT broker username
-   - **MQTT Password**: Your MQTT broker password
-5. Click "Save Configuration"
-6. The device will restart and connect to your network
+| Topic | Direction | Description |
+|-------|-----------|-------------|
+| `smartpot/temperature` | Publish | Temperature in degrees C (string, 2 decimal places) |
+| `smartpot/soil_moisture` | Publish | Raw ADC value from moisture sensor |
+| `smartpot/sunlight_presence` | Publish | `1` = light, `0` = dark |
+| `smartpot/last_watering_time` | Publish (retained) | ISO timestamp of last watering event |
+| `smartpot/water_command` | Publish / Subscribe | Plant monitor sends `"1"` to trigger watering |
+
+---
+
+## WiFi / MQTT Configuration
+
+Both units use the same captive portal flow:
+
+1. Power on (cold boot)
+2. Connect to the AP (`Smart-Pot` or `Watering-station`)
+3. Browser opens the configuration page automatically (captive portal) or navigate to `192.168.4.1`
+4. Fill in WiFi credentials and MQTT broker details
+5. Submit - the unit connects and begins operation
+
+Configuration is saved to NVS and survives reboot and deep sleep.
+
+---
+
+## Deep Sleep Behavior (Plant Monitor)
+
+| Condition | Behavior |
+|-----------|----------|
+| Cold boot | AP mode for configuration, then normal operation |
+| Dark (LDR below threshold) | Sleep 30 minutes, wake, send data, sleep again |
+| Light (LDR above threshold) | Stay awake, send data every 60 seconds |
+| MQTT connected + data sent + 15 s minimum awake | Eligible to sleep (if dark) |
+
+Timers that must survive sleep are accumulated in `rtcData.totalSleepTime` so that intervals like watering cooldown and beep suppression work correctly across wakeup cycles.
+
+---
+
+## Thresholds and Timing
+
+### Plant Monitor
+
+| Parameter | Value |
+|-----------|-------|
+| Moisture threshold (dry) | 2900 (ADC raw) |
+| Sunlight threshold | 1500 (ADC raw) |
+| Watering cooldown | 5 minutes |
+| Low moisture beep interval | 5 minutes |
+| Day publish interval | 60 seconds |
+| Night sleep interval | 30 minutes |
+| AP timeout (cold boot) | 3 minutes |
+| WiFi retry interval | 15 seconds |
+
+### Watering Station
+
+| Parameter | Value |
+|-----------|-------|
+| Pump on duration | 5 seconds |
+| AP timeout | 2 minutes |
+| WiFi retry interval | 15 seconds |
+| Status log interval | 10 seconds |
+
+---
 
 ## Home Assistant Integration
 
-### Step 1: Set up MQTT Broker
-
-**Option A: Mosquitto Add-on (Recommended)**
-1. Go to **Settings** → **Add-ons** → **Add-on Store**
-2. Install **"Mosquitto broker"**
-3. Start the add-on and enable **"Start on boot"**
-4. Create MQTT user credentials in the add-on configuration
-
-**Option B: External MQTT Broker**
-- Ensure your existing MQTT broker is accessible from Home Assistant
-- Note the IP address, port, username, and password
-
-### Step 2: Configure MQTT Integration
-
-1. Go to **Settings** → **Devices & Services** → **Add Integration**
-2. Search for **"MQTT"** and add it
-3. Configure with your broker details:
-   - **Broker**: Your MQTT broker IP (or `localhost` for Mosquitto add-on)
-   - **Port**: `1883`
-   - **Username**: Your MQTT username
-   - **Password**: Your MQTT password
-
-### Step 3: Add MQTT Entities
-
-Add the following to your `configuration.yaml` file:
+Add the following to `configuration.yaml` to expose all entities:
 
 ```yaml
 mqtt:
   sensor:
-    # Temperature sensor
     - name: "Smart Pot Temperature"
-      state_topic: "okoscserep/temperature"
-      unit_of_measurement: "°C"
+      state_topic: "smartpot/temperature"
+      unit_of_measurement: "C"
       device_class: temperature
-      icon: mdi:thermometer
-    
-    # Humidity sensor
-    - name: "Smart Pot Humidity"
-      state_topic: "okoscserep/humidity"
-      unit_of_measurement: "%"
-      device_class: humidity
-      icon: mdi:water-percent
-    
-    # Soil moisture sensor
+
     - name: "Smart Pot Soil Moisture"
-      state_topic: "okoscserep/soil_moisture"
-      unit_of_measurement: ""
-      icon: mdi:water-outline
-    
-    # Water level sensor
-    - name: "Smart Pot Water Level"
-      state_topic: "okoscserep/water_level"
-      unit_of_measurement: ""
-      icon: mdi:cup-water
-    
-    # Last watering time
+      state_topic: "smartpot/soil_moisture"
+
     - name: "Smart Pot Last Watering"
-      state_topic: "okoscserep/last_watering_time"
-      icon: mdi:watering-can
-    
+      state_topic: "smartpot/last_watering_time"
+
   binary_sensor:
-    # Sunlight detection
     - name: "Smart Pot Sunlight"
-      state_topic: "okoscserep/sunlight"
-      payload_on: "0"  # 0 means it's dark (no sunlight)
-      payload_off: "1" # 1 means there's sunlight
+      state_topic: "smartpot/sunlight_presence"
+      payload_on: "1"
+      payload_off: "0"
       device_class: light
-      icon: mdi:weather-sunny
-  
-  switch:
-    # Water refill notification trigger
-    - name: "Smart Pot Water Alert"
-      state_topic: "smart_flower_pot/notify"
-      command_topic: "smart_flower_pot/notify"
-      payload_on: "ON"
-      payload_off: "OFF"
-      icon: mdi:bell-alert
 ```
 
-### Step 4: Restart Home Assistant
+Restart Home Assistant after editing `configuration.yaml`.
 
-Restart Home Assistant to load the new MQTT entities.
+---
 
-### Step 5: Create Dashboard Card
+## Dependencies
 
-Add this card to your Lovelace dashboard:
+### Plant Monitor
 
-```yaml
-type: vertical-stack
-cards:
-  - type: custom:mushroom-title-card
-    title: Smart Flower Pot
-    subtitle: Monitoring & Care System
-  
-  - type: horizontal-stack
-    cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.smart_pot_temperature
-        name: Temperature
-        icon: mdi:thermometer
-      - type: custom:mushroom-entity-card
-        entity: sensor.smart_pot_humidity
-        name: Humidity
-        icon: mdi:water-percent
-  
-  - type: horizontal-stack
-    cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.smart_pot_soil_moisture
-        name: Soil Moisture
-        icon: mdi:water-outline
-      - type: custom:mushroom-entity-card
-        entity: sensor.smart_pot_water_level
-        name: Water Level
-        icon: mdi:cup-water
-  
-  - type: horizontal-stack
-    cards:
-      - type: custom:mushroom-entity-card
-        entity: binary_sensor.smart_pot_sunlight
-        name: Sunlight
-        icon: mdi:weather-sunny
-      - type: custom:mushroom-entity-card
-        entity: sensor.smart_pot_last_watering
-        name: Last Watered
-        icon: mdi:watering-can
-  
-  - type: custom:mushroom-entity-card
-    entity: switch.smart_pot_water_alert
-    name: Water Refill Alert
-    icon: mdi:bell-alert
-```
+- `OneWire`
+- `DallasTemperature`
+- `PubSubClient`
+- `WiFi`, `WebServer`, `DNSServer`, `Preferences`, `esp_sleep` (built-in ESP32 Arduino)
 
-> **Note**: The above card uses Mushroom cards. Install them via HACS or use a simple `entities` card instead.
+### Watering Station
 
-### Step 6: Set up Automations (Optional)
+- `PubSubClient`
+- `WiFi`, `WebServer`, `DNSServer`, `Preferences` (built-in ESP32 Arduino)
 
-Create automations for notifications and alerts:
+---
 
-```yaml
-# Low water level notification
-- id: smart_pot_low_water_alert
-  alias: "Smart Pot - Low Water Alert"
-  trigger:
-    - platform: state
-      entity_id: switch.smart_pot_water_alert
-      to: "on"
-  action:
-    - service: notify.mobile_app_your_phone  # Replace with your device
-      data:
-        title: "🌱 Smart Flower Pot"
-        message: "Water level is low! Time to refill the reservoir."
+## Notes
 
-# Plant watered notification
-- id: smart_pot_watered_notification
-  alias: "Smart Pot - Plant Watered"
-  trigger:
-    - platform: state
-      entity_id: sensor.smart_pot_last_watering
-  condition:
-    - condition: template
-      value_template: "{{ trigger.to_state.state != 'unknown' }}"
-  action:
-    - service: notify.mobile_app_your_phone  # Replace with your device
-      data:
-        title: "🌱 Plant Watered"
-        message: "Your plant was automatically watered at {{ states('sensor.smart_pot_last_watering') }}"
-```
-
-## MQTT Topics
-
-The device publishes to the following MQTT topics:
-
-| Topic | Description | Unit |
-|-------|-------------|------|
-| `okoscserep/temperature` | Temperature reading | °C |
-| `okoscserep/humidity` | Humidity percentage | % |
-| `okoscserep/soil_moisture` | Soil moisture level | Raw ADC value |
-| `okoscserep/water_level` | Water reservoir level | Raw ADC value |
-| `okoscserep/sunlight` | Light detection | 0 (dark) / 1 (light) |
-| `okoscserep/last_watering_time` | Last watering timestamp | HH:MM:SS |
-| `smart_flower_pot/notify` | Water refill alert | ON/OFF |
-
-## Troubleshooting
-
-### Device Not Connecting to WiFi
-1. Ensure WiFi credentials are correct
-2. Check if your router supports 2.4GHz (ESP32 doesn't support 5GHz)
-3. Verify the device is within WiFi range
-4. Reset the device and reconfigure through the captive portal
-
-### MQTT Connection Issues
-1. Verify MQTT broker is running and accessible
-2. Check firewall settings on the MQTT broker
-3. Ensure MQTT credentials are correct
-4. Test MQTT connection with tools like MQTT Explorer
-
-### Sensors Not Appearing in Home Assistant
-1. Check if MQTT integration is properly configured
-2. Verify the MQTT configuration in `configuration.yaml`
-3. Restart Home Assistant after adding MQTT entities
-4. Check Home Assistant logs for MQTT-related errors
-
-### Captive Portal Not Opening
-1. Make sure you're connected to the "Smart-flower-pot" WiFi network
-2. Try navigating manually to `http://4.3.2.1`
-3. Clear your browser cache and try again
-4. Try a different device or browser
-
-## Configuration
-
-### Sensor Thresholds
-You can modify these values in the Arduino code:
-
-```cpp
-const int MOISTURE_THRESHOLD = 2000;        // Soil moisture threshold for watering
-const int SUNLIGHT_THRESHOLD = 3000;       // Light threshold for day/night detection
-const int WATER_LEVEL_THRESHOLD = 1700;    // Low water level threshold
-```
-
-### Timing Settings
-```cpp
-const unsigned long WATERING_DURATION = 5000;           // Watering duration (5 seconds)
-const unsigned long LIGHT_SEND_INTERVAL = 60000;        // Data send interval during day (1 minute)
-const unsigned long DARK_SEND_INTERVAL = 600000UL;      // Data send interval during night (10 minutes)
-```
+- Both units use `configTime(3600, 3600, "pool.ntp.org")` for NTP time, providing CET offset with DST — adjust the second argument to `0` outside DST periods or use a proper POSIX timezone string for automatic DST handling
+- The DS18B20 returns `DEVICE_DISCONNECTED_C` on failure; this is checked before publishing to avoid sending garbage temperature values
+- Watering station button is debounced implicitly by the `pumpActive` flag preventing re-trigger while the pump is running
